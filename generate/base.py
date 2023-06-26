@@ -15,8 +15,8 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt import GPT, Tokenizer, Config
-from lit_gpt.model import Block
+from lit_gpt.tokenizer import Tokenizer
+from lit_gpt.model import Block, GPT, Config
 from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, quantization
 
 
@@ -149,7 +149,8 @@ def main(
 
     t0 = time.time()
     with lazy_load(checkpoint_path) as checkpoint:
-        model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
+        # TransformerEngine layers have an `_extra_state` parameter, so need to set `strict=False`
+        model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
     fabric.print(f"Time to load the model weights: {time.time() - t0:.02f} seconds.", file=sys.stderr)
 
     model.eval()

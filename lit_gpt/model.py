@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from typing_extensions import Self
 
 from lit_gpt.config import Config
+from lit_gpt.utils import find_multiple
 
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -57,10 +58,22 @@ class GPT(nn.Module):
             self.mask_cache = None
 
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+        self,
+        idx: torch.Tensor,
+        max_seq_length: Optional[int] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        padding_multiple: int = 1,
     ) -> torch.Tensor:
         B, T = idx.size()
         use_kv_cache = input_pos is not None
+
+        T_padded = find_multiple(T, padding_multiple)
+        padding = T_padded - T
+        if padding > 0:  # fp8 support
+            idx = F.pad(idx, (0, padding))  # right padding
+            if max_seq_length == T:
+                max_seq_length = T_padded
+            T = T_padded
 
         block_size = self.config.block_size
         if max_seq_length is None:
@@ -77,15 +90,18 @@ class GPT(nn.Module):
         # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
         # for the kv-cache support (only during inference), we only create it in that situation
         # this will be resolved by https://github.com/pytorch/pytorch/issues/96099
-        if use_kv_cache and self.mask_cache is None:
+        if (use_kv_cache or padding > 0) and self.mask_cache is None:
             self.mask_cache = self.build_mask_cache(idx)
 
         cos, sin = self.rope_cache
         if use_kv_cache:
             cos = cos.index_select(0, input_pos)
+            cos = torch.cat((cos, torch.zeros(padding, cos.size(1), device=cos.device)))
             sin = sin.index_select(0, input_pos)
+            sin = torch.cat((sin, torch.zeros(padding, sin.size(1), device=sin.device)))
             mask = self.mask_cache.index_select(2, input_pos)
             mask = mask[:, :, :, :max_seq_length]
+            mask = F.pad(mask, (0, 0, 0, padding))
         else:
             cos = cos[:T]
             sin = sin[:T]
@@ -96,15 +112,17 @@ class GPT(nn.Module):
 
         if not use_kv_cache:
             for block in self.transformer.h:
-                x, *_ = block(x, (cos, sin), max_seq_length)
+                x, *_ = block(x, (cos, sin), max_seq_length, mask, padding=padding)
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1))
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
+                x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i], padding)
 
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)  # (b, t, vocab_size)
+
+        logits = logits[:, : -padding or None]
 
         return logits
 
@@ -160,9 +178,10 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        padding: int = 0,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         n_1 = self.norm_1(x)
-        h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+        h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache, padding)
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
             x = x + h + self.mlp(n_2)
@@ -196,6 +215,7 @@ class CausalSelfAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        padding: int = 0,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -228,18 +248,28 @@ class CausalSelfAttention(nn.Module):
             cache_k, cache_v = cache_k.to(dtype=k.dtype), cache_v.to(dtype=v.dtype)
             # check if reached token limit
             if input_pos[-1] >= max_seq_length:
-                input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
+                input_pos = torch.tensor([max_seq_length - 1], device=input_pos.device)
                 # shift 1 position to the left
                 cache_k = torch.roll(cache_k, -1, dims=2)
                 cache_v = torch.roll(cache_v, -1, dims=2)
+            padding_idx = cache_k.size(2) - 1  # send padding data to a padding index, doesn't matter which
+            input_pos = torch.cat(
+                (input_pos, torch.full((padding,), padding_idx, device=input_pos.device, dtype=input_pos.dtype))
+            )
             k = cache_k.index_copy_(2, input_pos, k)
             v = cache_v.index_copy_(2, input_pos, v)
             kv_cache = k, v
 
-        # efficient attention using Flash Attention CUDA kernels
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, scale=1.0 / math.sqrt(self.config.head_size), is_causal=mask is None
-        )
+        scale = 1.0 / math.sqrt(self.config.head_size)
+        if padding == 0:
+            y = F.scaled_dot_product_attention(q, k, v, mask, dropout_p=0.0, scale=scale, is_causal=mask is None)
+        else:
+            # `scaled_dot_product_attention` produces nans when padding is added
+            # https://github.com/pytorch/pytorch/issues/103749
+            att = (q @ k.transpose(-2, -1)) * scale  # (B, nh, T, T)
+            att = torch.masked_fill(att, ~mask, torch.finfo(att.dtype).min)
+            att = F.softmax(att, dim=-1)
+            y = att @ v  # (B, nh, T, hs)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
