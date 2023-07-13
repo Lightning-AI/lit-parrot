@@ -4,7 +4,7 @@ import time
 import warnings
 from functools import partial
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 import lightning as L
 import torch
@@ -15,9 +15,70 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt import GPT, Tokenizer, Config
+from lit_gpt import GPT, Config, Tokenizer
 from lit_gpt.model import Block
-from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, quantization
+from lit_gpt.utils import check_valid_checkpoint_dir, lazy_load, quantization
+
+
+def build_llm(
+    checkpoint_dir: Path = Path(f"checkpoints/stabilityai/stablelm-base-alpha-3b"),
+    quantize: Optional[
+        Literal[
+            "bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"
+        ]
+    ] = None,
+    strategy: str = "auto",
+    devices: int = 1,
+    precision: str = "bf16-true",
+):
+    if strategy == "fsdp":
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy, transformer_layer_cls={Block}
+        )
+        strategy = FSDPStrategy(auto_wrap_policy=auto_wrap_policy, cpu_offload=False)
+    fabric = L.Fabric(devices=devices, precision=precision, strategy=strategy)
+    fabric.launch()
+    checkpoint_dir = Path(checkpoint_dir)
+    check_valid_checkpoint_dir(checkpoint_dir)
+
+    with open(checkpoint_dir / "lit_config.json") as fp:
+        config = Config(**json.load(fp))
+
+    if quantize is not None and devices > 1:
+        raise NotImplementedError
+    if quantize == "gptq.int4":
+        model_file = "lit_model_gptq.4bit.pth"
+        if not (checkpoint_dir / model_file).is_file():
+            raise ValueError("Please run `python quantize/gptq.py` first")
+    else:
+        model_file = "lit_model.pth"
+    checkpoint_path = checkpoint_dir / model_file
+
+    fabric.print(
+        f"Loading model {str(checkpoint_path)!r} with {config.__dict__}",
+        file=sys.stderr,
+    )
+    t0 = time.time()
+    with fabric.init_module(empty_init=True), quantization(quantize):
+        model = GPT(config)
+    fabric.print(
+        f"Time to instantiate model: {time.time() - t0:.02f} seconds.", file=sys.stderr
+    )
+
+    t0 = time.time()
+    with lazy_load(checkpoint_path) as checkpoint:
+        model.load_state_dict(
+            checkpoint.get("model", checkpoint), strict=quantize is None
+        )
+    fabric.print(
+        f"Time to load the model weights: {time.time() - t0:.02f} seconds.",
+        file=sys.stderr,
+    )
+
+    model.eval()
+    model = fabric.setup_module(model)
+    tokenizer = Tokenizer(checkpoint_dir)
+    return model, tokenizer, fabric
 
 
 @torch.no_grad()
@@ -99,7 +160,9 @@ def main(
     temperature: float = 0.8,
     checkpoint_dir: Path = Path(f"checkpoints/stabilityai/stablelm-base-alpha-3b"),
     quantize: Optional[
-        Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]
+        Literal[
+            "bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"
+        ]
     ] = None,
     strategy: str = "auto",
     devices: int = 1,
@@ -124,42 +187,8 @@ def main(
         devices: How many devices to use.
         precision: Indicates the Fabric precision setting to use.
     """
-    if strategy == "fsdp":
-        auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
-        strategy = FSDPStrategy(auto_wrap_policy=auto_wrap_policy, cpu_offload=False)
-    fabric = L.Fabric(devices=devices, precision=precision, strategy=strategy)
-    fabric.launch()
+    model, tokenizer, fabric = build_llm(checkpoint_dir=checkpoint_dir, devices=devices, precision=precision, quantize=quantize, strategy=strategy)
 
-    check_valid_checkpoint_dir(checkpoint_dir)
-
-    with open(checkpoint_dir / "lit_config.json") as fp:
-        config = Config(**json.load(fp))
-
-    if quantize is not None and devices > 1:
-        raise NotImplementedError
-    if quantize == "gptq.int4":
-        model_file = "lit_model_gptq.4bit.pth"
-        if not (checkpoint_dir / model_file).is_file():
-            raise ValueError("Please run `python quantize/gptq.py` first")
-    else:
-        model_file = "lit_model.pth"
-    checkpoint_path = checkpoint_dir / model_file
-
-    fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
-    t0 = time.time()
-    with fabric.init_module(empty_init=True), quantization(quantize):
-        model = GPT(config)
-    fabric.print(f"Time to instantiate model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
-
-    t0 = time.time()
-    with lazy_load(checkpoint_path) as checkpoint:
-        model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
-    fabric.print(f"Time to load the model weights: {time.time() - t0:.02f} seconds.", file=sys.stderr)
-
-    model.eval()
-    model = fabric.setup_module(model)
-
-    tokenizer = Tokenizer(checkpoint_dir)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     prompt_length = encoded.size(0)
     max_returned_tokens = prompt_length + max_new_tokens
@@ -185,10 +214,14 @@ def main(
         fabric.print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
         fabric.print(
-            f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
+            f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec",
+            file=sys.stderr,
         )
     if fabric.device.type == "cuda":
-        fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)
+        fabric.print(
+            f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
