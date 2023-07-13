@@ -17,7 +17,7 @@ sys.path.append(str(wd))
 
 from lit_gpt import Config
 from lit_gpt.model import GPT, Block
-from lit_gpt.speed_monitor import SpeedMonitor, measure_flops, estimate_flops
+from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_flops, estimate_flops
 from lit_gpt.utils import step_csv_logger, chunked_cross_entropy
 
 model_name = "pythia-70m"

@@ -16,7 +16,7 @@ from generate.base import generate
 from lit_gpt.lora import mark_only_lora_as_trainable, lora_filter, GPT, Config
 from lit_gpt.tokenizer import Tokenizer
 from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, step_csv_logger, chunked_cross_entropy
-from lit_gpt.speed_monitor import SpeedMonitor, measure_flops, estimate_flops
+from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_flops, estimate_flops
 from scripts.prepare_alpaca import generate_prompt
 
 

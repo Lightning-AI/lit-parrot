@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from types import MethodType
-from typing import Optional, Any, Union, List
+from typing import Optional, Any, Union, List, TypeVar, Type
 
 import torch
 import torch.utils._device
@@ -401,8 +401,11 @@ class incremental_save:
         self.zipfile.write_end_of_file()
 
 
-def step_csv_logger(*args: Any, **kwargs: Any) -> CSVLogger:
-    logger = CSVLogger(*args, **kwargs)
+T = TypeVar("T")
+
+
+def step_csv_logger(*args: Any, cls: Type[T] = CSVLogger, **kwargs: Any) -> T:
+    logger = cls(*args, **kwargs)
 
     def merge_by(dicts, key):
         from collections import defaultdict
