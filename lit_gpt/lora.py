@@ -43,13 +43,14 @@ two matrices of a lower rank.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Any, List, Union
+from typing import Optional, Tuple, Any, List, Type, Union
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
+import lit_gpt
 from lit_gpt.config import Config as BaseConfig
 from lit_gpt.model import (
     GPT as BaseModel,
@@ -85,6 +86,71 @@ class LoRALayer:
         # Mark the weight as unmerged
         self.merged = False
         self.merge_weights = merge_weights
+
+
+class Linear(nn.Linear, LoRALayer):
+    # LoRA implemented in a dense layer
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        # Actual trainable parameters
+        if r > 0:
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r > 0:
+                    self.weight.data -= T(self.lora_B @ self.lora_A) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0:
+                    self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)
+            if self.r > 0:
+                result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
 
 
 class MergedLinear(nn.Linear, LoRALayer):
@@ -390,11 +456,51 @@ class Config(BaseConfig):
             "This scaling helps to reduce the need to retune hyperparameters when we vary r"
             https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
         dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+        to_*: either apply LoRA to the specified weights or not
     """
 
     r: int = 0.0
     alpha: int = 1.0
     dropout: float = 0.0
+    to_query: bool = False
+    to_key: bool = False
+    to_value: bool = False
+    to_projection: bool = False
+    to_mlp: bool = False
+    to_head: bool = False
+
+    @property
+    def mlp_class(self) -> Type:
+        # `self._mlp_class` cannot be the type to keep the config json serializable
+        obj = lit_gpt.lora if self.to_mlp else lit_gpt.model
+        return getattr(obj, self._mlp_class)
+
+class GptNeoxMLP(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.fc = Linear(config.n_embd, config.intermediate_size, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+        self.proj = Linear(config.intermediate_size, config.n_embd, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc(x)
+        x = torch.nn.functional.gelu(x)
+        x = self.proj(x)
+        return x
+
+
+class LLaMAMLP(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.fc_1 = Linear(config.n_embd, config.intermediate_size, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+        self.fc_2 = Linear(config.n_embd, config.intermediate_size, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+        self.proj = Linear(config.intermediate_size, config.n_embd, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fc_1 = self.fc_1(x)
+        x_fc_2 = self.fc_2(x)
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        x = self.proj(x)
+        return x
 
 
 class GPT(BaseModel):
@@ -403,7 +509,11 @@ class GPT(BaseModel):
         assert config.padded_vocab_size is not None
         self.config = config
 
-        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
+        if config.to_head:
+            self.lm_head = Linear(config.n_embd, config.padded_vocab_size, bias=False, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
@@ -510,7 +620,7 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             r=config.r,
             lora_alpha=config.alpha,
             lora_dropout=config.dropout,
-            enable_lora=(True, False, True),
+            enable_lora=(config.to_query, config.to_key, config.to_value),
             fan_in_fan_out=False,
             merge_weights=True,
             bias=config.bias,
@@ -519,6 +629,9 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             n_query_groups=config.n_query_groups,
         )
         # output projection
-        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        if config.to_projection:
+            self.proj = Linear(config.n_embd, config.n_embd, bias=config.bias, r=config.r, lora_alpha=config.alpha, lora_dropout=config.dropout)
+        else:
+            self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         self.config = config
